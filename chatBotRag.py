@@ -6,6 +6,7 @@ from langchain_community.llms import Ollama
 from langchain.prompts import PromptTemplate
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import FAISS
+import faiss
 
 def get_category_prompt_template():
     """Prompt template for category browsing in Vietnamese."""
@@ -50,8 +51,40 @@ def get_product_prompt_template():
     return PromptTemplate(template=template, input_variables=["context", "question"])
 
 def load_vector_db(vector_db_path):
+    """Loads a FAISS vector database and strictly moves it to GPU."""
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    print(f"Đang tải cơ sở dữ liệu vector từ: {vector_db_path}")
     db = FAISS.load_local(vector_db_path, embeddings, allow_dangerous_deserialization=True)
+    print("Cơ sở dữ liệu vector đã được tải vào CPU. Chuẩn bị chuyển sang GPU.")
+
+    if not (faiss.get_num_gpus() > 0 and hasattr(faiss, "StandardGpuResources") and hasattr(faiss, "index_cpu_to_gpu")):
+        raise RuntimeError(
+            "FAISS-GPU is required for loading. No GPU detected by FAISS or faiss-gpu components "
+            "(StandardGpuResources, index_cpu_to_gpu) are missing. "
+            "Please ensure you have a compatible GPU, CUDA installed, and faiss-gpu installed correctly via Conda."
+        )
+    
+    current_index = db.index
+    is_cpu_index = "Gpu" not in type(current_index).__name__ # A simple check
+
+    if is_cpu_index:
+        print(f"Số GPU có sẵn: {faiss.get_num_gpus()}. Đang chuyển chỉ mục FAISS đã tải sang GPU 0...")
+        try:
+            res = faiss.StandardGpuResources()  # Initialize GPU resources
+            # Assuming we always want to use the first GPU (device 0)
+            db.index = faiss.index_cpu_to_gpu(res, 0, current_index) 
+            print("Chỉ mục FAISS đã được chuyển thành công sang GPU.")
+        except Exception as e:
+            # This error will now stop the application if GPU transfer fails.
+            raise RuntimeError(f"Không thể chuyển chỉ mục FAISS từ CPU sang GPU: {e}")
+    else:
+        # This case implies the index loaded was already a GpuIndex, which is unusual for load_local.
+        # Or, the type check was not accurate.
+        print("Chỉ mục FAISS đã ở trên GPU hoặc không được nhận dạng là chỉ mục CPU có thể chuyển đổi.")
+        # We can add an explicit check here if we want to be more robust
+        if not (hasattr(faiss, "GpuIndex") and isinstance(db.index, faiss.GpuIndex)):
+             print("Cảnh báo: Chỉ mục không phải là GpuIndex như mong đợi sau khi tải.")
+
     return db
 
 def is_category_query(query):
@@ -72,7 +105,7 @@ def is_category_query(query):
     return False
 
 def setup_rag_chain(vector_db, query):
-    llm = Ollama(model="qwen2.5:7b")
+    llm = Ollama(model="gemma3:4b")
     
     if is_category_query(query):  
         retriever = vector_db.as_retriever(
@@ -134,16 +167,25 @@ def process_images(response, is_category):
     return image_paths, image_captions
 
 def run_app():
-    st.title("Trợ lý Mua sắm Thông minh")
+    st.title("Trợ lý Mua sắm Thông minh (GPU Required)")
     
     vector_db_path = "vector_db"
     if not os.path.exists(vector_db_path):
-        st.error("Không tìm thấy cơ sở dữ liệu vector. Vui lòng chạy create_vector_db.py trước.")
+        st.error("Không tìm thấy thư mục cơ sở dữ liệu vector. Vui lòng chạy createVectorDb.py (yêu cầu GPU) trước.")
         return
     
-    with st.spinner("Đang tải hệ thống gợi ý..."):
-        vector_db = load_vector_db(vector_db_path)
-    
+    try:
+        with st.spinner("Đang tải hệ thống gợi ý (Yêu cầu GPU)..."):
+            vector_db = load_vector_db(vector_db_path)
+        st.success("Hệ thống gợi ý đã sẵn sàng trên GPU!")
+    except RuntimeError as e:
+        st.error(f"LỖI KHỞI TẠO HỆ THỐNG: {e}")
+        st.error("Vui lòng đảm bảo bạn có GPU tương thích, trình điều khiển CUDA và faiss-gpu được cài đặt đúng cách từ Conda.")
+        return
+    except Exception as e:
+        st.error(f"Đã xảy ra lỗi không mong muốn khi tải cơ sở dữ liệu vector: {e}")
+        return
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
